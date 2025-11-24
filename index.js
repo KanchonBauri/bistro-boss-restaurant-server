@@ -1,9 +1,25 @@
 const express = require('express');
 const app = express();
 const cors = require('cors');
+const SSLCommerzPayment = require('sslcommerz-lts')
 const jwt = require('jsonwebtoken');
+const otpStore = {}; // temporary, keyed by email — production এ Redis বা DB লাগবে
+const admin = require('firebase-admin');
 require('dotenv').config()
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const formData = require('form-data');
+const Mailgun = require('mailgun.js');
+const mailgun = new Mailgun(formData);
+const mg = mailgun.client({
+    username: 'api',
+    key: process.env.MAIL_GUN_API_KEY,
+});
+
+let bkashToken = '';
+let bkashTokenExpiry = 0;
+const axios = require('axios');
+
+
 const port = process.env.PORT || 5000;
 
 // middleware
@@ -24,10 +40,17 @@ const client = new MongoClient(uri, {
     }
 });
 
+
+const store_id = process.env.STORE_ID 
+const store_passwd = process.env.STORE_PASS
+const is_live = false //true for live, false for sandbox
+
+
+
 async function run() {
     try {
         // Connect the client to the server	(optional starting in v4.7)
-        await client.connect();
+        // await client.connect();
 
 
 
@@ -35,6 +58,7 @@ async function run() {
         const menuCollection = client.db("bistroDb").collection("menu");
         const reviewCollection = client.db("bistroDb").collection("reviews");
         const cartCollection = client.db("bistroDb").collection("carts");
+        const cardCollection = client.db("bistroDb").collection("cards");
         const paymentCollection = client.db("bistroDb").collection("payments");
 
 
@@ -78,11 +102,18 @@ async function run() {
         }
 
 
+        admin.initializeApp({
+            credential: admin.credential.cert(require('./firebase-admin-sdk.json')),
+        });
+
+
         // users related api
         app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
             const result = await userCollection.find().toArray();
             res.send(result);
         });
+
+
 
 
 
@@ -138,6 +169,71 @@ async function run() {
             res.send(result);
         })
 
+
+        // reset user password 
+        app.post('/send-otp', async (req, res) => {
+            const { email } = req.body;
+            if (!email) return res.status(400).send({ message: "Email required" });
+
+            const otp = Math.floor(100000 + Math.random() * 900000).toString(); // 6-digit OTP
+
+            otpStore[email] = otp; // save otp for verification later
+
+            try {
+                await mg.messages.create(process.env.MAIL_SENDING_DOMAIN, {
+                    from: "Bistro Boss <noreply@mail.bistroboss.com>",
+                    to: [email],
+                    subject: "Your Password Reset Code",
+                    html: `<h2>Your OTP code is <strong>${otp}</strong></h2><p>Use this code to reset your password.</p>`,
+                });
+
+                res.send({ message: "OTP sent" });
+            } catch (error) {
+                console.error(error);
+                res.status(500).send({ message: "Failed to send OTP" });
+            }
+        });
+
+
+        // const admin = require('firebase-admin');
+
+        // Initialize admin sdk with your service account
+        // admin.initializeApp({
+        //     credential: admin.credential.cert(require('./path/to/serviceAccountKey.json')),
+        // });
+
+        app.post('/reset-password', async (req, res) => {
+            const { email, otp, newPassword } = req.body;
+
+            if (!email || !otp || !newPassword) {
+                return res.status(400).send({ message: "Missing fields" });
+            }
+
+            if (otpStore[email] !== otp) {
+                return res.status(400).send({ message: "Invalid OTP" });
+            }
+
+            try {
+                // Find user by email
+                const user = await admin.auth().getUserByEmail(email);
+
+                // Update password
+                await admin.auth().updateUser(user.uid, { password: newPassword });
+
+                // OTP একবার ইউজ করার পর ডিলিট করে দাও
+                delete otpStore[email];
+
+                res.send({ message: "Password reset successful" });
+            } catch (error) {
+                console.error(error);
+                res.status(500).send({ message: "Password reset failed" });
+            }
+        });
+
+
+
+
+
         // menu related apis
         app.get('/menu', async (req, res) => {
             const result = await menuCollection.find().toArray();
@@ -182,10 +278,38 @@ async function run() {
             res.send(result);
         })
 
+        // reviews collection
+        app.post('/reviews', async (req, res) => {
+            const review = req.body;
+            const result = await reviewCollection.insertOne(review);
+            res.send(result);
+        });
+
         app.get('/reviews', async (req, res) => {
             const result = await reviewCollection.find().toArray();
             res.send(result);
         });
+
+        app.delete('/reviews/:id', async (req, res) => {
+            const id = req.params.id;
+            const result = await reviewCollection.deleteOne({ _id: new ObjectId(id) });
+            res.send(result);
+        });
+
+        // cards collection 
+        app.get('/cards', async (req, res) => {
+            const result = await cardCollection.find().toArray();
+            res.send(result);
+        });
+
+        app.post('/cards', async (req, res) => {
+            const cartItem = req.body;
+            const result = await cardCollection.insertOne(cartItem);
+            res.send(result);
+        });
+
+
+
 
         // carts collection
         app.get('/carts', async (req, res) => {
@@ -194,6 +318,8 @@ async function run() {
             const result = await cartCollection.find(query).toArray();
             res.send(result);
         });
+
+
 
         app.post('/carts', async (req, res) => {
             const cartItem = req.body;
@@ -208,7 +334,34 @@ async function run() {
             res.send(result);
         })
 
+
+
+        // Payments stutus changes
         // payment intent
+        app.get('/payments', async (req, res) => {
+            const result = await paymentCollection.find().toArray();
+            res.send(result);
+        });
+
+        app.patch('/payments/:id', async (req, res) => {
+            const id = req.params.id;
+            const { status } = req.body;
+            const filter = { _id: new ObjectId(id) };
+            const updateDoc = {
+                $set: { status: status },
+            };
+            const result = await paymentCollection.updateOne(filter, updateDoc);
+            res.send(result);
+        });
+
+        app.delete('/payments/:id', async (req, res) => {
+            const id = req.params.id;
+            const query = { _id: new ObjectId(id) };
+            const result = await paymentCollection.deleteOne(query);
+            res.send(result);
+        });
+
+
         app.post('/create-payment-intent', async (req, res) => {
             const { price } = req.body;
             const amount = price * 100; // Convert to cents
@@ -245,12 +398,221 @@ async function run() {
 
             const deleteResult = await cartCollection.deleteMany(query);
 
+            // send user email about payment fonformation
+            mg.messages
+                .create(process.env.MAIL_SENDING_DOMAIN, {
+                    from: "Bistro Boss <noreply@mail.bistroboss.com>",
+                    to: ["kanchonbauri1998@gmail.com"],
+                    subject: "Bistro Boss Order Confirmation",
+                    text: "Testing some Mailgun awesomness!",
+                    html: `
+            <div>
+              <h2>Thank you for your order</h2>
+              <h4>Your Transaction Id: <strong>${payment.transactionId}</strong></h4>
+              <p>We would like to get your feedback about the food</p>
+            </div>
+                `
+                })
+                .then(msg => console.log(msg)) // logs response data
+                .catch(err => console.log(err)) // logs any error
+
             res.send({ paymentResult, deleteResult });
         })
 
+        //stats or analytics 
+        app.get('/admin-stats', verifyToken, verifyAdmin, async (req, res) => {
+            const users = await userCollection.estimatedDocumentCount();
+            const menuItems = await menuCollection.estimatedDocumentCount();
+            const reviews = await reviewCollection.estimatedDocumentCount();
+            const orders = await paymentCollection.estimatedDocumentCount();
+
+            // this is not the best way
+            // const payments = await paymentCollection.find().toArray();
+            // const revenue = payments.reduce((total, payment) => total + payment.price, 0);
+
+            const result = await paymentCollection.aggregate([
+                {
+                    $group: {
+                        _id: null,
+                        totalRevenue: {
+                            $sum: '$price'
+                        }
+                    }
+                }
+            ]).toArray();
+
+            const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+
+            res.send({
+                users,
+                menuItems,
+                reviews,
+                orders,
+                revenue
+            });
+        })
+
+        // order status
+        /**
+         * ----------------------------
+         *    NON-Efficient Way
+         * ------------------------------
+         * 1. load all the payments
+         * 2. for every menuItemIds (which is an array), go find the item from menu collection
+         * 3. for every item in the menu collection that you found from a payment entry (document)
+        */
+
+        // using aggregate pipeline
+        app.get('/order-stats', verifyToken, verifyAdmin, async (req, res) => {
+            const result = await paymentCollection.aggregate([
+                {
+                    $unwind: '$menuItemIds'
+                },
+                {
+                    $lookup: {
+                        from: 'menu',
+                        localField: 'menuItemIds',
+                        foreignField: '_id',
+                        as: 'menuItems'
+                    }
+                },
+                {
+                    $unwind: '$menuItems'
+                },
+                {
+                    $group: {
+                        _id: '$menuItems.category',
+                        quantity: { $sum: 1 },
+                        revenue: { $sum: '$menuItems.price' }
+                    }
+                },
+                {
+                    $project: {
+                        _id: 0,
+                        category: '$_id',
+                        quantity: '$quantity',
+                        revenue: '$revenue'
+                    }
+                }
+            ]).toArray();
+
+            res.send(result);
+
+        })
+
+
+        // Express Backend এ bKash Routes যুক্ত 
+        // ✅ bKash Token নিয়ন্ত্রণ:
+        let bkashToken = '';
+        let bkashTokenExpiry = 0;
+
+        async function getBkashToken() {
+            if (!bkashToken || Date.now() >= bkashTokenExpiry) {
+                const auth = Buffer.from(`${process.env.BKASH_USERNAME}:${process.env.BKASH_PASSWORD}`).toString('base64');
+                try {
+                    const response = await axios.post(`${process.env.BKASH_BASE_URL}/tokenized/checkout/token/grant`, {
+                        app_key: process.env.BKASH_APP_KEY,
+                        app_secret: process.env.BKASH_APP_SECRET
+                    }, {
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'authorization': `Basic ${auth}`
+                        }
+                    });
+
+                    bkashToken = response.data.id_token;
+                    bkashTokenExpiry = Date.now() + (response.data.expires_in * 1000);
+                    console.log('New bKash token acquired');
+                } catch (error) {
+                    console.error('Failed to get bKash token:', error.response ? error.response.data : error.message);
+                    throw new Error('Failed to get bKash token');
+                }
+            }
+            return bkashToken;
+        }
+
+        app.post('/bkash-create-payment', async (req, res) => {
+            const { amount, invoice } = req.body;
+            if (!amount || !invoice) {
+                return res.status(400).send({ message: 'Amount and invoice are required' });
+            }
+
+            try {
+                const token = await getBkashToken();
+
+                const response = await axios.post(`${process.env.BKASH_BASE_URL}/tokenized/checkout/create`, {
+                    mode: '0011',
+                    payerReference: ' ',
+                    callbackURL: 'https://yourdomain.com/bkash/callback', // ✅ change this to your domain
+                    amount: amount,
+                    currency: 'BDT',
+                    intent: 'sale',
+                    merchantInvoiceNumber: invoice
+                }, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        authorization: token,
+                        'x-app-key': process.env.BKASH_APP_KEY
+                    }
+                });
+
+                // ✅ Send both bkashURL and paymentID to frontend
+                res.send({
+                    paymentID: response.data.paymentID,
+                    bkashURL: response.data.bkashURL
+                });
+            } catch (error) {
+                console.error('Create payment error:', error.response?.data || error.message);
+                res.status(500).send({ message: 'Failed to create bKash payment' });
+            }
+        });
+
+
+        app.get('/bkash/callback', async (req, res) => {
+            const paymentID = req.query.paymentID;
+
+            if (!paymentID) return res.status(400).send('Payment ID not provided');
+
+            try {
+                const token = await getBkashToken();
+
+                const executeRes = await axios.post(`${process.env.BKASH_BASE_URL}/tokenized/checkout/execute`, {
+                    paymentID
+                }, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        authorization: token,
+                        'x-app-key': process.env.BKASH_APP_KEY
+                    }
+                });
+
+                const paymentData = executeRes.data;
+
+                // ✅ Save to database
+                await paymentCollection.insertOne({
+                    paymentID: paymentID,
+                    trxID: paymentData.trxID,
+                    amount: paymentData.amount,
+                    status: paymentData.transactionStatus,
+                    date: new Date()
+                });
+
+                // ✅ Redirect user to success page (frontend)
+                res.redirect(`https://yourfrontend.com/dashboard/paymentSuccess?trxID=${paymentData.trxID}`);
+            } catch (error) {
+                console.error('Execute payment error:', error.response?.data || error.message);
+                res.status(500).send('Payment execution failed');
+            }
+        });
+
+
+
+
+
+
         // Send a ping to confirm a successful connection
-        await client.db("admin").command({ ping: 1 });
-        console.log("Pinged your deployment. You successfully connected to MongoDB!");
+        // await client.db("admin").command({ ping: 1 });
+        // console.log("Pinged your deployment. You successfully connected to MongoDB!");
     } finally {
         // Ensures that the client will close when you finish/error
         // await client.close();
